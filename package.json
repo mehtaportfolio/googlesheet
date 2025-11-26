@@ -1,0 +1,15 @@
+{
+  "name": "stock-sync",
+  "version": "1.0.0",
+  "type": "module",
+  "scripts": {
+    "start": "node stock.js"
+  },
+  "dependencies": {
+    "@supabase/supabase-js": "^2.85.0",
+    "dotenv": "^16.6.1",
+    "express": "^4.21.2",
+    "googleapis": "^118.0.0",
+    "node-fetch": "^3.3.2"
+  }
+}
