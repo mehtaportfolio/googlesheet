@@ -12,8 +12,18 @@ const app = express();
 const PORT = process.env.PORT || 3000;
 
 app.get("/", (req, res) => {
-  res.send("🟢 Server is running. Use /mf, /amfi, /stocks, /nps endpoints to sync data.");
+  res.send(`
+    <h2>🚀 Google Sheet Sync Service Running</h2>
+    <p>Available Endpoints:</p>
+    <ul>
+      <li><a href="/mf">/mf</a> - Sync Mutual Funds</li>
+      <li><a href="/amfi">/amfi</a> - Sync AMFI NAV</li>
+      <li><a href="/stocks">/stocks</a> - Sync Stock Prices</li>
+      <li><a href="/nps">/nps</a> - Sync NPS Data</li>
+    </ul>
+  `);
 });
+
 
 // ---- Mutual Funds ----
 app.get("/mf", async (req, res) => {
