@@ -1,5 +1,6 @@
 // server.js
 import express from "express";
+import cors from "cors";
 import dotenv from "dotenv";
 dotenv.config();
 
@@ -9,6 +10,7 @@ import { syncStocks } from "./stocks.js"; // assuming your first script is stock
 import { fetchAndSyncNPSNAVs } from "./nps.js";
 
 const app = express();
+app.use(cors({ origin: "*", methods: ["GET", "POST"] }));
 const PORT = process.env.PORT || 3000;
 
 app.get("/", (req, res) => {
@@ -24,6 +26,9 @@ app.get("/", (req, res) => {
   `);
 });
 
+app.post("/restart", (req, res) => {
+  res.json({ status: "info", message: "Server restart not required." });
+});
 
 // ---- Mutual Funds ----
 app.get("/mf", async (req, res) => {
