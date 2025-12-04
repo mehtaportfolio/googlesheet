@@ -309,3 +309,7 @@ debugListSheets()
   })
   .then(console.log)
   .catch(console.error);
+
+
+export { fastNAVUpdate };
+
