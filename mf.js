@@ -181,4 +181,4 @@ export async function syncMF() {
 })();
 
 // Export the main function for Node.js
-export { syncMutualFunds };
+export { syncMF };
