@@ -179,3 +179,6 @@ export async function syncMF() {
     console.error("❌ ERROR:", err.message);
   }
 })();
+
+// Export the main function for Node.js
+export { syncMutualFunds };
