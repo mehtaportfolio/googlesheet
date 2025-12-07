@@ -4,7 +4,7 @@ import cors from "cors";
 import dotenv from "dotenv";
 dotenv.config();
 
-import { syncMutualFunds } from "./mf.js";
+import { syncMF } from "./mf.js";
 import { fastNAVUpdate } from "./amfi.js";
 import { syncStocks } from "./stocks.js"; // assuming your first script is stocks.js
 import { fetchAndSyncNPSNAVs } from "./nps.js";

@@ -180,5 +180,3 @@ export async function syncMF() {
   }
 })();
 
-// Export the main function for Node.js
-export { syncMF };
