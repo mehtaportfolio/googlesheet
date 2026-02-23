@@ -30,6 +30,10 @@ app.post("/restart", (req, res) => {
   res.json({ status: "info", message: "Server restart not required." });
 });
 
+app.get("/health", (req, res) => {
+  res.status(200).send("OK");
+});
+
 // ---- Mutual Funds ----
 app.get("/mf", async (req, res) => {
   try {
