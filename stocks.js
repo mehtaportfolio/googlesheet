@@ -1,21 +1,22 @@
-import express from "express";
 import { google } from "googleapis";
 import { createClient } from "@supabase/supabase-js";
+import fetch from "node-fetch";
 import dotenv from "dotenv";
 dotenv.config();
 
-const app = express();
+// --------- CONFIG ----------
+const serviceAccount = JSON.parse(
+  Buffer.from(process.env.GS_JSON_BASE64, "base64").toString("utf-8")
+);
 
-// --------- GOOGLE SHEETS AUTH ----------
 const auth = new google.auth.JWT(
-  process.env.GS_CLIENT_EMAIL,
+  serviceAccount.client_email,
   null,
-  process.env.GS_PRIVATE_KEY.replace(/\\n/g, "\n"),
+  serviceAccount.private_key,
   ["https://www.googleapis.com/auth/spreadsheets"]
 );
 const sheets = google.sheets({ version: "v4", auth });
 
-// --------- SUPABASE ----------
 const supabase = createClient(
   process.env.SUPABASE_URL,
   process.env.SUPABASE_API_KEY
@@ -30,193 +31,135 @@ const numOrNull = v => {
   return isNaN(n) ? null : n;
 };
 
-const isBlankOrPlaceholder = val => {
-  if (!val) return true;
-  const s = val.toString().trim().toUpperCase();
-  return s === "" || s === "N/A" || s === "UNKNOWN";
-};
-
-// ---------------- SHEET HELPERS ----------------
-async function getSheetValues() {
-  const res = await sheets.spreadsheets.values.get({
-    spreadsheetId: process.env.GOOGLE_SHEET_ID,
-    range: `${process.env.GOOGLE_SHEET_NAME}!A1:Z20000`
-  });
-  return res.data.values || [];
-}
-
-async function setValues(range, values) {
-  await sheets.spreadsheets.values.update({
-    spreadsheetId: process.env.GOOGLE_SHEET_ID,
-    range,
-    valueInputOption: "RAW",
-    requestBody: { values }
-  });
+// ---------------- TRIGGER EXTERNAL UPDATER ----------------
+async function triggerYahooFinanceUpdater() {
+  const renderUrl = "https://stock-yahoo.onrender.com/fill-missing-cmp";
+  try {
+    const response = await fetch(renderUrl);
+    console.log("✅ Yahoo Finance updater triggered. Status:", response.status);
+  } catch (err) {
+    console.log("❌ Failed to trigger Render backend:", err.message);
+  }
 }
 
 // ---------------- MAIN SYNC FUNCTION ----------------
 async function syncStocks() {
-  console.log("🔄 Sync started...");
+  console.log("🔄 Starting Google Sheet ↔ Supabase sync...");
 
-  // ---------- 1) FETCH SUPABASE ----------
-  const { data: supabaseRows, error } = await supabase
-    .from(process.env.SUPABASE_TABLE_NAME)
-    .select(
-      "stock_name,symbol,cmp,lcp,macro_sector,sector,known_sector,industry,basic_industry,category"
-    );
+  try {
+    // STEP 1: FETCH ALL SUPABASE ROWS (PAGINATED)
+    let supRows = [];
+    let from = 0;
+    const batchSize = 1000;
 
-  if (error) throw new Error(error.message);
+    while (true) {
+      const { data, error } = await supabase
+        .from(process.env.SUPABASE_TABLE_NAME)
+        .select("stock_name,symbol")
+        .range(from, from + batchSize - 1);
 
-  const supSet = new Set(supabaseRows.map(r => norm(r.symbol)));
-  const supMap = Object.fromEntries(
-    supabaseRows.map(r => [norm(r.symbol), r])
-  );
+      if (error) throw new Error("Supabase fetch failed: " + error.message);
+      if (!data || data.length === 0) break;
 
-  // ---------- 2) READ SHEET ----------
-  const all = await getSheetValues();
-  if (all.length <= 1) return;
-
-  const rows = all.slice(1);
-
-  const nameToRow = {};
-  const symbolToRow = {};
-
-  rows.forEach((r, i) => {
-    if (r[0]) nameToRow[norm(r[0])] = i + 2;
-    if (r[1]) symbolToRow[norm(r[1])] = i + 2;
-  });
-
-  const additions = [];
-
-  // ---------- 3) SUPABASE → SHEET (NAME / SYMBOL ONLY) ----------
-  for (const r of supabaseRows) {
-    const stockName = norm(r.stock_name);
-    const symbol = norm(r.symbol);
-    if (!stockName || !symbol) continue;
-
-    const rowBySymbol = symbolToRow[symbol];
-    const rowByName = nameToRow[stockName];
-
-    if (rowBySymbol) {
-      const sheetRow = rows[rowBySymbol - 2];
-      if (norm(sheetRow[0]) !== stockName) {
-        await setValues(
-          `${process.env.GOOGLE_SHEET_NAME}!A${rowBySymbol}`,
-          [[r.stock_name]]
-        );
-      }
-    } else if (rowByName) {
-      await setValues(
-        `${process.env.GOOGLE_SHEET_NAME}!B${rowByName}`,
-        [[symbol]]
-      );
-    } else {
-      additions.push([r.stock_name, r.symbol]);
+      supRows = supRows.concat(data);
+      if (data.length < batchSize) break;
+      from += batchSize;
     }
-  }
 
-  if (additions.length) {
-    await sheets.spreadsheets.values.append({
+    // STEP 2: READ SHEET ONCE
+    const res = await sheets.spreadsheets.values.get({
       spreadsheetId: process.env.GOOGLE_SHEET_ID,
-      range: `${process.env.GOOGLE_SHEET_NAME}!A:B`,
-      valueInputOption: "RAW",
-      requestBody: { values: additions }
+      range: `${process.env.GOOGLE_SHEET_NAME}!A:J`
     });
-  }
+    let sheetData = res.data.values || [];
 
-  // ---------- REFRESH SHEET ----------
-  const refreshed = await getSheetValues();
-  const rows2 = refreshed.slice(1).filter(r => r[1]);
+    const sheetMap = {};
+    sheetData.forEach((r, i) => {
+      const symbol = norm(r[1]);
+      if (symbol) sheetMap[symbol] = i;
+    });
 
-  // ---------- 4) DELETE ROWS NOT IN SUPABASE ----------
-  for (let i = rows2.length - 1; i >= 0; i--) {
-    if (!supSet.has(norm(rows2[i][1]))) {
-      await sheets.spreadsheets.batchUpdate({
-        spreadsheetId: process.env.GOOGLE_SHEET_ID,
-        requestBody: {
-          requests: [{
-            deleteDimension: {
-              range: {
-                sheetId: 0,
-                dimension: "ROWS",
-                startIndex: i + 1,
-                endIndex: i + 2
-              }
-            }
-          }]
+    const supSymbolSet = new Set();
+
+    // STEP 3: APPLY SUPABASE → SHEET IN MEMORY
+    let nextEmptyIndex = 0;
+    const findNextEmpty = () => {
+      while (nextEmptyIndex < sheetData.length && norm(sheetData[nextEmptyIndex][1])) {
+        nextEmptyIndex++;
+      }
+      return nextEmptyIndex;
+    };
+
+    supRows.forEach(r => {
+      const symbol = norm(r.symbol);
+      const name = r.stock_name;
+      if (!symbol) return;
+
+      supSymbolSet.add(symbol);
+
+      if (sheetMap.hasOwnProperty(symbol)) {
+        const index = sheetMap[symbol];
+        if (!name) {
+          sheetData[index] = Array(10).fill("");
+        } else {
+          sheetData[index][0] = name;
+          sheetData[index][1] = symbol;
         }
+      } else if (name) {
+        const index = findNextEmpty();
+        if (index < sheetData.length) {
+          sheetData[index][0] = name;
+          sheetData[index][1] = symbol;
+        } else {
+          const newRow = new Array(10).fill("");
+          newRow[0] = name;
+          newRow[1] = symbol;
+          sheetData.push(newRow);
+        }
+        sheetMap[symbol] = index; // Mark as taken
+      }
+    });
+
+    // STEP 4: WRITE ONLY NAME + SYMBOL (DO NOT TOUCH FORMULAS)
+    if (sheetData.length > 0) {
+      const nameSymbolData = sheetData.map(r => [r[0] || "", r[1] || ""]);
+      await sheets.spreadsheets.values.update({
+        spreadsheetId: process.env.GOOGLE_SHEET_ID,
+        range: `${process.env.GOOGLE_SHEET_NAME}!A2`,
+        valueInputOption: "RAW",
+        requestBody: { values: nameSymbolData }
       });
     }
-  }
 
-  // ---------- 5) SAFE BATCH SUPABASE → SHEET (NO FORMULAS) ----------
-  const macroSectorCol = [];
-  const sectorCol = [];
-  const knownSectorCol = [];
-  const industryCol = [];
-  const basicIndustryCol = [];
+    // STEP 5: SHEET → SUPABASE (UPSERT BULK)
+    const payload = sheetData
+      .filter(r => r[1])
+      .map(r => ({
+        symbol: norm(r[1]),
+        cmp: numOrNull(r[2]),
+        lcp: numOrNull(r[3]),
+        category: r[4] || null
+      }));
 
-  rows2.forEach(r => {
-    const sup = supMap[norm(r[1])] || {};
-    macroSectorCol.push([sup.macro_sector || r[4]]);
-    sectorCol.push([sup.sector || r[5]]);
-    knownSectorCol.push([sup.known_sector || r[6]]);
-    industryCol.push([sup.industry || r[7]]);
-    basicIndustryCol.push([sup.basic_industry || r[8]]);
-  });
+    if (payload.length > 0) {
+      const { error: upsertError } = await supabase
+        .from(process.env.SUPABASE_TABLE_NAME)
+        .upsert(payload, { onConflict: "symbol" });
 
-  const startRow = 2;
-  const rowCount = rows2.length;
-
-  await setValues(`${process.env.GOOGLE_SHEET_NAME}!E${startRow}`, macroSectorCol);
-  await setValues(`${process.env.GOOGLE_SHEET_NAME}!F${startRow}`, sectorCol);
-  await setValues(`${process.env.GOOGLE_SHEET_NAME}!G${startRow}`, knownSectorCol);
-  await setValues(`${process.env.GOOGLE_SHEET_NAME}!H${startRow}`, industryCol);
-  await setValues(`${process.env.GOOGLE_SHEET_NAME}!I${startRow}`, basicIndustryCol);
-
-  // ---------- 6) SHEET → SUPABASE (CATEGORY ONLY) ----------
-  const updatePayload = [];
-
-  rows2.forEach(r => {
-    const symbol = norm(r[1]);
-    const supRow = supMap[symbol];
-    if (supRow && r[9] !== supRow.category) {
-      updatePayload.push({ symbol, category: r[9] });
+      if (upsertError) throw new Error("Supabase upsert failed: " + upsertError.message);
     }
-  });
 
-  if (updatePayload.length) {
-    await supabase
-      .from(process.env.SUPABASE_TABLE_NAME)
-      .upsert(updatePayload, { onConflict: "symbol" });
-  }
+    console.log("🚀 ULTRA SUPER FAST SYNC COMPLETED");
+    
+    // Trigger the external updater just like the Apps Script does
+    await triggerYahooFinanceUpdater();
 
-  // ---------- 7) CMP / LCP UPDATE ----------
-  const cmpPayload = rows2
-    .filter(r => supSet.has(norm(r[1])))
-    .map(r => ({
-      symbol: r[1],
-      cmp: numOrNull(r[2]),
-      lcp: numOrNull(r[3])
-    }));
+    return { success: true, rowsSynced: sheetData.length };
 
-  if (cmpPayload.length) {
-    await supabase
-      .from(process.env.SUPABASE_TABLE_NAME)
-      .upsert(cmpPayload, { onConflict: "symbol" });
-  }
-
-  console.log("✅ Sync completed.");
-  return { success: true };
-}
-
-// ---------- API ENDPOINT ----------
-app.get("/sync", async (_, res) => {
-  try {
-    res.json(await syncStocks());
   } catch (err) {
-    res.json({ error: err.message });
+    console.log("❌ SYNC ERROR: " + err.message);
+    throw err;
   }
-});
+}
 
 export { syncStocks };

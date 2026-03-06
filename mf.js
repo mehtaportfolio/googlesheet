@@ -1,25 +1,26 @@
 import { google } from "googleapis";
 import { createClient } from "@supabase/supabase-js";
+import fetch from "node-fetch";
 import dotenv from "dotenv";
 dotenv.config();
 
 // ---------------------------
-// GOOGLE AUTH (SERVICE ACCOUNT FILE)
+// GOOGLE AUTH
 // ---------------------------
-// Decode Base64 JSON into object
 const serviceAccount = JSON.parse(
   Buffer.from(process.env.GS_JSON_BASE64, "base64").toString("utf-8")
 );
 
-const auth = new google.auth.GoogleAuth({
-  credentials: serviceAccount,       // <-- Use credentials directly
-  scopes: ["https://www.googleapis.com/auth/spreadsheets"],
-});
-
+const auth = new google.auth.JWT(
+  serviceAccount.client_email,
+  null,
+  serviceAccount.private_key,
+  ["https://www.googleapis.com/auth/spreadsheets"]
+);
 
 const sheets = google.sheets({
   version: "v4",
-  auth: await auth.getClient(),
+  auth,
 });
 
 // ---------------------------
@@ -37,12 +38,30 @@ const numOrNull = (v) => {
   return isNaN(n) ? null : n;
 };
 
+// Simple cache for sheet data
+let sheetCache = {
+  data: null,
+  timestamp: 0,
+};
+
 async function readSheet(sheetId, range) {
+  const now = Date.now();
+  if (sheetCache.data && now - sheetCache.timestamp < 30000) {
+    console.log("🟢 Using cached sheet data");
+    return sheetCache.data;
+  }
+
   const res = await sheets.spreadsheets.values.get({
     spreadsheetId: sheetId,
     range,
   });
-  return res.data.values || [];
+
+  const values = res.data.values || [];
+  sheetCache = {
+    data: values,
+    timestamp: now,
+  };
+  return values;
 }
 
 async function appendRows(sheetId, sheetName, rows) {
@@ -77,7 +96,7 @@ export async function syncMF() {
 
   // STEP 2 – GOOGLE SHEET
   console.log("📄 Reading Google Sheet...");
-  const all = await readSheet(SHEET_ID, `${SHEET_NAME}!A1:Z50000`);
+  const all = await readSheet(SHEET_ID, `${SHEET_NAME}!A:Z`);
   const headers = all[0];
   const rows = all.slice(1);
 
@@ -170,6 +189,7 @@ export async function syncMF() {
 // ---------------------------
 // RUN WHEN EXECUTED DIRECTLY
 // ---------------------------
+/*
 (async () => {
   console.log("⏳ Running MF Sync locally...");
   try {
@@ -179,4 +199,5 @@ export async function syncMF() {
     console.error("❌ ERROR:", err.message);
   }
 })();
+*/
 

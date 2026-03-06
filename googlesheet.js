@@ -5,7 +5,7 @@ import dotenv from "dotenv";
 dotenv.config();
 
 import { syncMF } from "./mf.js";
-import { fastNAVUpdate } from "./amfi.js";
+import { runMFWorkflow } from "./amfi.js";
 import { syncStocks } from "./stocks.js"; // assuming your first script is stocks.js
 import { fetchAndSyncNPSNAVs } from "./nps.js";
 
@@ -37,7 +37,7 @@ app.get("/health", (req, res) => {
 // ---- Mutual Funds ----
 app.get("/mf", async (req, res) => {
   try {
-    const result = await syncMutualFunds();
+    const result = await syncMF();
     res.json({ status: "success", result });
   } catch (err) {
     res.json({ status: "error", message: err.toString() });
@@ -48,7 +48,7 @@ app.get("/mf", async (req, res) => {
 app.get("/amfi", async (req, res) => {
   try {
     const sheetName = req.query.sheet || "MF";
-    const result = await fastNAVUpdate(sheetName);
+    const result = await runMFWorkflow(sheetName);
     res.json({ status: "success", result });
   } catch (err) {
     res.json({ status: "error", message: err.toString() });

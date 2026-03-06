@@ -3,7 +3,7 @@
   "version": "1.0.0",
   "type": "module",
   "scripts": {
-    "start": "node stock.js"
+    "start": "node googlesheet.js"
   },
   "dependencies": {
     "@supabase/supabase-js": "^2.85.0",

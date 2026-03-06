@@ -2,29 +2,31 @@
 // IMPORTS (ES MODULE)
 // -------------------------------
 import { google } from "googleapis";
+import fetch from "node-fetch";
 import dotenv from "dotenv";
 dotenv.config();
 
 // -------------------------------
 // CONFIG
 // -------------------------------
-const SHEET_ID = "1gXrhmYx0IjIp-F4IZAf4mAqHJEbIAZER2U3MOLX2dZY";
+const SHEET_ID = process.env.GOOGLE_SHEET_ID;
 
 // -------------------------------
 // GOOGLE AUTH (ESM)
 // -------------------------------
 async function getSheetsClient() {
-const serviceAccount = JSON.parse(
-  Buffer.from(process.env.GS_JSON_BASE64, "base64").toString("utf-8")
-);
+  const serviceAccount = JSON.parse(
+    Buffer.from(process.env.GS_JSON_BASE64, "base64").toString("utf-8")
+  );
 
-const auth = new google.auth.GoogleAuth({
-  credentials: serviceAccount,   // Use the decoded JSON
-  scopes: ["https://www.googleapis.com/auth/spreadsheets"]
-});
+  const auth = new google.auth.JWT(
+    serviceAccount.client_email,
+    null,
+    serviceAccount.private_key,
+    ["https://www.googleapis.com/auth/spreadsheets"]
+  );
 
-
-  return google.sheets({ version: "v4", auth: await auth.getClient() });
+  return google.sheets({ version: "v4", auth });
 }
 
 // -------------------------------
@@ -59,26 +61,46 @@ function formatDate(d) {
 async function runMFWorkflow(sheetName = "MF") {
   const sheets = await getSheetsClient();
 
-  const mf = await readSheet(sheets, sheetName);
-  const mf1 = await readSheet(sheets, "MF1");
+  // STEP 0 → Read both sheets in one go
+  const res = await sheets.spreadsheets.values.batchGet({
+    spreadsheetId: SHEET_ID,
+    ranges: [`${sheetName}!A:Z`, "MF1!A:Z"],
+  });
 
-  if (!mf) return "❌ MF sheet not found";
-  if (!mf1) return "❌ MF1 sheet not found";
+  const valueRanges = res.data.valueRanges || [];
+  const mfData = valueRanges[0]?.values || [];
+  const mf1Data = valueRanges[1]?.values || [];
+
+  const mf = { name: sheetName, data: mfData };
+  const mf1 = { name: "MF1", data: mf1Data };
+
+  if (mfData.length === 0) return "❌ MF sheet not found or empty";
+  if (mf1Data.length === 0) return "❌ MF1 sheet not found or empty";
 
   // STEP 1 → BEFORE NAV FETCH
   await updateLCPfromMF(sheets, mf, mf1);
 
   // STEP 2 → FETCH NEW NAVs
-  const navMsg = await fastNAVUpdate(sheets, sheetName);
+  const navMsg = await fastNAVUpdate(sheets, sheetName, mfData);
+
+  // RE-READ MF sheet to get updated NAVs for Step 3
+  // (We could theoretically avoid this by updating mfData in memory during Step 2,
+  // but let's keep it safe with one re-read for now or optimize further if needed)
+  const mfUpdatedRes = await sheets.spreadsheets.values.get({
+    spreadsheetId: SHEET_ID,
+    range: `${sheetName}!A:Z`,
+  });
+  const mfUpdatedData = mfUpdatedRes.data.values || [];
+  const mfUpdated = { name: sheetName, data: mfUpdatedData };
 
   // STEP 3 → AFTER NAV FETCH
-  await updateCMPfromMF(sheets, mf, mf1);
+  await updateCMPfromMF(sheets, mfUpdated, mf1);
 
   return navMsg + "\nCMP/LCP sync completed.";
 }
 
 // -------------------------------
-// READ SHEET
+// READ SHEET (KEEP FOR INDIVIDUAL CALLS IF NEEDED)
 // -------------------------------
 async function readSheet(sheets, sheetName) {
   try {
@@ -100,18 +122,6 @@ async function readSheet(sheets, sheetName) {
 }
 
 // -------------------------------
-// WRITE SHEET
-// -------------------------------
-async function writeSheet(sheets, range, values) {
-  await sheets.spreadsheets.values.update({
-    spreadsheetId: SHEET_ID,
-    range,
-    valueInputOption: "RAW",
-    requestBody: { values }
-  });
-}
-
-// -------------------------------
 // STEP 1 — UPDATE LCP
 // -------------------------------
 async function updateLCPfromMF(sheets, mf, mf1) {
@@ -121,29 +131,43 @@ async function updateLCPfromMF(sheets, mf, mf1) {
   const header = mfData[0];
   const dateCol = header.indexOf("Date");
   const navCol = header.indexOf("NAV");
+  const isinCol = header.indexOf("ISIN");
 
   const mf1Map = {};
   for (let i = 1; i < mf1Data.length; i++) {
-    const isin = mf1Data[i][1];
+    const isin = (mf1Data[i][1] || "").trim().toUpperCase();
     if (isin) mf1Map[isin] = i;
   }
 
   const today = new Date();
   const dayBeforeYesterday = new Date(today.getFullYear(), today.getMonth(), today.getDate() - 2);
 
+  const updates = [];
+
   for (let i = 1; i < mfData.length; i++) {
-    const isin = mfData[i][1];
+    const isin = (mfData[i][isinCol] || "").trim().toUpperCase();
     const dt = parseDate(mfData[i][dateCol]);
     if (!dt || dt > dayBeforeYesterday) continue;
 
     const nav = mfData[i][navCol];
-    const row = mf1Map[isin];
-    if (row >= 0 && mf1Data[row]) {
-      mf1Data[row][4] = nav;   // LCP column
+    const rowIdx = mf1Map[isin];
+    if (rowIdx >= 0) {
+      updates.push({
+        range: `MF1!${colLetter(5)}${rowIdx + 1}`,   // LCP is Column E (5)
+        values: [[nav]]
+      });
     }
   }
 
-  await writeSheet(sheets, "MF1!A1", mf1Data);
+  if (updates.length > 0) {
+    await sheets.spreadsheets.values.batchUpdate({
+      spreadsheetId: SHEET_ID,
+      requestBody: {
+        valueInputOption: "RAW",
+        data: updates
+      }
+    });
+  }
 }
 
 // -------------------------------
@@ -156,40 +180,64 @@ async function updateCMPfromMF(sheets, mf, mf1) {
   const header = mfData[0];
   const dateCol = header.indexOf("Date");
   const navCol = header.indexOf("NAV");
+  const isinCol = header.indexOf("ISIN");
 
   const mf1Map = {};
   for (let i = 1; i < mf1Data.length; i++) {
-    const isin = mf1Data[i][1];
+    const isin = (mf1Data[i][1] || "").trim().toUpperCase();
     if (isin) mf1Map[isin] = i;
   }
 
-  const yesterday = new Date();
-  yesterday.setDate(yesterday.getDate() - 1);
-  const yesterdayStr = formatDate(yesterday);
+  let maxDate = null;
+  for (let i = 1; i < mfData.length; i++) {
+    const dt = parseDate(mfData[i][dateCol]);
+    if (dt && (!maxDate || dt > maxDate)) maxDate = dt;
+  }
+  
+  const latestDateStr = formatDate(maxDate);
+  console.log(`Syncing CMP for date: ${latestDateStr}`);
+
+  const updates = [];
 
   for (let i = 1; i < mfData.length; i++) {
-    const isin = mfData[i][1];
+    const isin = (mfData[i][isinCol] || "").trim().toUpperCase();
     const dt = formatDate(parseDate(mfData[i][dateCol]));
-    if (!isin || !dt || dt !== yesterdayStr) continue;
+    if (!isin || !dt || dt !== latestDateStr) continue;
 
     const nav = mfData[i][navCol];
-    const row = mf1Map[isin];
-    if (row >= 0 && mf1Data[row]) {
-      mf1Data[row][3] = nav; // CMP column
+    const rowIdx = mf1Map[isin];
+    if (rowIdx >= 0) {
+      updates.push({
+        range: `MF1!${colLetter(4)}${rowIdx + 1}`, // CMP is Column D (4)
+        values: [[nav]]
+      });
     }
   }
 
-  await writeSheet(sheets, "MF1!A1", mf1Data);
+  if (updates.length > 0) {
+    await sheets.spreadsheets.values.batchUpdate({
+      spreadsheetId: SHEET_ID,
+      requestBody: {
+        valueInputOption: "RAW",
+        data: updates
+      }
+    });
+  }
 }
 
 // -------------------------------
 // FAST NAV UPDATE (AMFI)
 // -------------------------------
-async function fastNAVUpdate(sheets, sheetName) {
-  const sheet = await readSheet(sheets, sheetName);
-  if (!sheet) return "❌ Sheet not found";
+async function fastNAVUpdate(sheets, sheetName, initialData = null) {
+  let data;
+  if (initialData) {
+    data = initialData;
+  } else {
+    const sheet = await readSheet(sheets, sheetName);
+    if (!sheet) return "❌ Sheet not found";
+    data = sheet.data;
+  }
 
-  const data = sheet.data;
   const header = data[0];
 
   let schemeCodeCol = header.indexOf("Scheme Code");
@@ -302,6 +350,7 @@ async function debugListSheets() {
 // -------------------------------
 // RUN
 // -------------------------------
+/*
 debugListSheets()
   .then(() => {
     console.log("\nRunning workflow...\n");
@@ -309,7 +358,7 @@ debugListSheets()
   })
   .then(console.log)
   .catch(console.error);
+*/
 
-
-export { fastNAVUpdate };
+export { fastNAVUpdate, runMFWorkflow };
 

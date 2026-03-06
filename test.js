@@ -1,15 +1,16 @@
-import fs from "fs";
 import { google } from "googleapis";
 import dotenv from "dotenv";
 dotenv.config();
 
-// Load key from PEM
-const privateKey = fs.readFileSync("./service-account-key.pem", "utf8");
+// Load key from ENV
+const serviceAccount = JSON.parse(
+  Buffer.from(process.env.GS_JSON_BASE64, "base64").toString("utf-8")
+);
 
 const auth = new google.auth.JWT(
-  process.env.GS_CLIENT_EMAIL,
+  serviceAccount.client_email,
   null,
-  privateKey,
+  serviceAccount.private_key,
   ["https://www.googleapis.com/auth/spreadsheets"]
 );
 

@@ -7,10 +7,14 @@ dotenv.config();
 console.log("⏳ Running NPS NAV Sync...");
 
 // ---- GOOGLE SHEET AUTH ----
+const serviceAccount = JSON.parse(
+  Buffer.from(process.env.GS_JSON_BASE64, "base64").toString("utf-8")
+);
+
 const auth = new google.auth.JWT(
-  process.env.GS_CLIENT_EMAIL,
+  serviceAccount.client_email,
   null,
-  process.env.GS_PRIVATE_KEY.replace(/\\n/g, "\n"),
+  serviceAccount.private_key,
   ["https://www.googleapis.com/auth/spreadsheets"]
 );
 const sheets = google.sheets({ version: "v4", auth });
@@ -27,13 +31,13 @@ const numOrNull = v => {
 
 async function fetchAndSyncNPSNAVs() {
   const SHEET_ID = process.env.GOOGLE_SHEET_ID;
-  const SHEET_NAME = "nps"; // Sheet name
-  const SUPABASE_TABLE = process.env.SUPABASE_TABLE_NPS;
+  const SHEET_NAME = "nps";
+  const SUPABASE_TABLE = process.env.SUPABASE_TABLE_NPS || "nps_pension_fund_master";
 
-  // ---- Read sheet data ----
+  // ---- Read sheet data (starting from row 2, columns A to E) ----
   const sheetData = await sheets.spreadsheets.values.get({
     spreadsheetId: SHEET_ID,
-    range: `${SHEET_NAME}!A2:E1000`,
+    range: `${SHEET_NAME}!A2:E`,
   });
 
   const data = sheetData.data.values || [];
@@ -43,49 +47,59 @@ async function fetchAndSyncNPSNAVs() {
   }
 
   const baseUrl = "https://www.npsnav.in/api/detailed/";
+  
+  // Prepare API requests in parallel
+  const requests = data.map((row, i) => {
+    const schemeCode = (row[1] || "").toString().trim();
+    if (!schemeCode) return null;
+    return { schemeCode, rowIndex: i };
+  }).filter(req => req !== null);
+
+  const responses = await Promise.all(
+    requests.map(async (req) => {
+      try {
+        const res = await fetch(baseUrl + req.schemeCode);
+        const navData = await res.json();
+        return { ...req, navData };
+      } catch (e) {
+        console.log(`⚠️ Error fetching NAV for ${req.schemeCode}: ${e}`);
+        return { ...req, error: e };
+      }
+    })
+  );
+
   let supabasePayload = [];
 
-  // 1️⃣ Copy cmp → lcp in memory
-  for (let row of data) {
-    if (row[2]) row[3] = row[2]; // cmp → lcp
-  }
+  for (const res of responses) {
+    if (res.error) continue;
+    
+    const rowIndex = res.rowIndex;
+    const navData = res.navData;
+    const latestNAV = parseFloat(navData["NAV"]);
 
-  // 2️⃣ Fetch latest NAVs
-  for (let i = 0; i < data.length; i++) {
-    const schemeName = data[i][0];
-    const schemeCode = data[i][1];
-    const cmp = data[i][2];
-    const lcp = data[i][3];
-    const fundName = data[i][4];
+    if (isNaN(latestNAV)) continue;
 
-    if (!schemeCode || schemeCode.trim() === "") {
-      console.log(`⏭️ Skipping empty scheme code at row ${i + 2}`);
-      continue;
+    const schemeName = data[rowIndex][0];
+    const schemeCode = data[rowIndex][1];
+    const currentCMP = parseFloat(data[rowIndex][2]);
+    const fundName = data[rowIndex][4];
+
+    // Update only if NAV changed
+    if (latestNAV !== currentCMP) {
+      data[rowIndex][3] = currentCMP || null; // LCP = old CMP
+      data[rowIndex][2] = latestNAV;          // CMP = new NAV
     }
 
-    try {
-      const res = await fetch(baseUrl + schemeCode);
-      const navData = await res.json();
-      const latestCmp = parseFloat(navData["NAV"]);
-      if (isNaN(latestCmp)) throw new Error("Invalid NAV response");
-
-      // update cmp in memory
-      data[i][2] = latestCmp;
-
-      // prepare Supabase row
-      supabasePayload.push({
-        scheme_name: schemeName,
-        scheme_code: schemeCode,
-        cmp: isNaN(latestCmp) ? null : latestCmp,
-        lcp: isNaN(lcp) || lcp === "" ? null : parseFloat(lcp),
-        fund_name: fundName || null,
-      });
-    } catch (e) {
-      console.log(`⚠️ Error fetching NAV for ${schemeCode}: ${e}`);
-    }
+    supabasePayload.push({
+      scheme_name: schemeName,
+      scheme_code: schemeCode,
+      cmp: data[rowIndex][2] || null,
+      lcp: data[rowIndex][3] || null,
+      fund_name: fundName || null
+    });
   }
 
-  // 3️⃣ Update sheet with new cmp + lcp
+  // ---- Update sheet with new cmp + lcp ----
   await sheets.spreadsheets.values.update({
     spreadsheetId: SHEET_ID,
     range: `${SHEET_NAME}!A2`,
@@ -93,17 +107,16 @@ async function fetchAndSyncNPSNAVs() {
     requestBody: { values: data },
   });
 
-  // 4️⃣ Upsert into Supabase
+  // ---- Upsert into Supabase ----
   if (supabasePayload.length > 0) {
     const { data: upsertRes, error } = await supabase
       .from(SUPABASE_TABLE)
-      .upsert(supabasePayload, { onConflict: ["scheme_code"] });
+      .upsert(supabasePayload, { onConflict: "scheme_code" });
 
     if (error) {
       console.log("❌ Supabase upsert error:", error);
     } else {
-      const rowCount = Array.isArray(upsertRes) ? upsertRes.length : 0;
-      console.log(`✅ Supabase upsert successful: ${rowCount} rows`);
+      console.log(`✅ Supabase sync completed: ${supabasePayload.length} rows`);
     }
   } else {
     console.log("No NAV data to sync.");
@@ -111,7 +124,9 @@ async function fetchAndSyncNPSNAVs() {
 }
 
 // Run the sync locally
+/*
 fetchAndSyncNPSNAVs().then(() => console.log("✔️ Done"));
+*/
 
 // Export the main function for Node.js
 export { fetchAndSyncNPSNAVs };
