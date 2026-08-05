@@ -138,7 +138,8 @@ async function syncStocks() {
         symbol: norm(r[1]),
         cmp: numOrNull(r[2]),
         lcp: numOrNull(r[3]),
-        category: r[4] || null
+        category: r[4] || null,
+        market_cap: numOrNull(r[5])
       }));
 
     if (payload.length > 0) {
